@@ -13,6 +13,7 @@ struct UsageWindow {
 
 struct ServiceUsage {
     var plan: String?
+    var account: String?  // who this data belongs to, read from the live token
     var windows: [UsageWindow] = []
     var extras: [UsageWindow] = []
     var error: String?
@@ -147,6 +148,7 @@ struct ClaudeSource {
         ])
         var usage = ServiceUsage()
         if let plan = creds["subscriptionType"] as? String { usage.plan = plan.capitalized }
+        usage.account = accountEmail(token: token)  // best-effort; never blocks usage
         if let w = window(json["five_hour"], label: "Session (5h)") { usage.windows.append(w) }
         if let w = window(json["seven_day"], label: "Weekly") { usage.windows.append(w) }
         if let w = window(json["seven_day_opus"], label: "Weekly · Opus") { usage.extras.append(w) }
@@ -159,6 +161,17 @@ struct ClaudeSource {
         guard let dict = object as? [String: Any],
               let pct = (dict["utilization"] as? NSNumber)?.doubleValue else { return nil }
         return UsageWindow(label: label, usedPercent: pct, resetsAt: parseISO(dict["resets_at"]))
+    }
+
+    // Identity of the account this token belongs to, so the menu names whose
+    // limits it is showing. Same token as the usage call, so the two can't drift.
+    private func accountEmail(token: String) -> String? {
+        guard let json = try? httpJSON("https://api.anthropic.com/api/oauth/profile", headers: [
+            "Authorization": "Bearer \(token)",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": Self.userAgent,
+        ]), let account = json["account"] as? [String: Any] else { return nil }
+        return (account["email"] as? String) ?? (account["display_name"] as? String)
     }
 
     private func readCredentials() throws -> (creds: [String: Any], ancestor: String) {
@@ -337,6 +350,7 @@ struct CodexSource {
         let json = try httpJSON("https://chatgpt.com/backend-api/wham/usage", headers: headers)
         var usage = ServiceUsage()
         if let plan = json["plan_type"] as? String { usage.plan = plan.capitalized }
+        usage.account = jwtEmail(token)  // decoded from the same access token
         if let rateLimit = json["rate_limit"] as? [String: Any] {
             if let w = window(rateLimit["primary_window"]) { usage.windows.append(w) }
             if let w = window(rateLimit["secondary_window"]) { usage.windows.append(w) }
@@ -444,6 +458,22 @@ struct CodexSource {
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let exp = (object["exp"] as? NSNumber)?.doubleValue else { return 0 }
         return exp
+    }
+
+    // The account email is carried inside the access-token JWT, so the menu can
+    // name whose limits it shows without any extra request.
+    private func jwtEmail(_ jwt: String?) -> String? {
+        guard let jwt else { return nil }
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var b64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        b64 += String(repeating: "=", count: (4 - b64.count % 4) % 4)
+        guard let data = Data(base64Encoded: b64),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profile = object["https://api.openai.com/profile"] as? [String: Any] else { return nil }
+        return profile["email"] as? String
     }
 
     private func refresh(auth: [String: Any], tokens: [String: Any], ancestorToken: String)
@@ -672,7 +702,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             button.title = text
         }
-        button.toolTip = name + " — " + usage.windows
+        let who = usage.account.map { " (\($0))" } ?? ""
+        button.toolTip = name + who + " — " + usage.windows
             .map { "\($0.label): \(Int($0.remainingPercent.rounded()))% left" }
             .joined(separator: " · ")
     }
@@ -754,6 +785,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             items.append(item)
             return items
         }
+        if let account = usage.account, !account.isEmpty {
+            let acct = NSMenuItem(title: account, action: nil, keyEquivalent: "")
+            acct.isEnabled = false
+            acct.indentationLevel = 1
+            items.append(acct)
+        }
         for w in usage.windows + usage.extras {
             let line = "\(w.label): \(Int(w.remainingPercent.rounded()))% left\(resetSuffix(w.resetsAt))"
             let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
@@ -825,7 +862,7 @@ func describeFetch() {
             "\(w.label) \(Int(w.remainingPercent.rounded()))% left (used \(w.usedPercent)%)"
                 + (w.resetsAt.map { ", resets \($0)" } ?? "")
         }
-        print("\(name) [\(usage.plan ?? "?")]: " + parts.joined(separator: "; "))
+        print("\(name) [\(usage.plan ?? "?")] <\(usage.account ?? "unknown account")>: " + parts.joined(separator: "; "))
     }
     describe("Claude", ClaudeSource().fetch())
     describe("Codex", CodexSource().fetch())
