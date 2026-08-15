@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import ServiceManagement
+import SwiftUI
 
 // MARK: - Model
 
@@ -57,6 +58,7 @@ func shell(_ command: [String], timeout: TimeInterval = 15) -> (status: Int32, s
 
 func httpJSON(_ urlString: String, method: String = "GET",
               headers: [String: String] = [:], jsonBody: [String: Any]? = nil,
+              formBody: [String: String]? = nil,
               timeout: TimeInterval = 25) throws -> [String: Any] {
     guard let url = URL(string: urlString) else { throw FetchError.parse("bad URL") }
     var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
@@ -65,6 +67,15 @@ func httpJSON(_ urlString: String, method: String = "GET",
     if let body = jsonBody {
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    } else if let formBody {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let encoded = formBody.map { key, value in
+            let v = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+            return "\(key)=\(v)"
+        }.joined(separator: "&")
+        request.httpBody = encoded.data(using: .utf8)
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     }
     let semaphore = DispatchSemaphore(value: 0)
     var outcome: Result<(Data, Int), Error> = .failure(FetchError.parse("no response"))
@@ -547,6 +558,231 @@ struct CodexSource {
     }
 }
 
+// MARK: - Grok (token in ~/.grok/auth.json, same storage the xAI Grok CLI uses)
+
+struct GrokSource {
+    static let authPath = NSHomeDirectory() + "/.grok/auth.json"
+    static let tokenURL = "https://auth.x.ai/oauth2/token"
+    static let usageURL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+    static let userAgent = "grok-cli"
+    // auth.json is a map keyed by "<issuer>::<client_id>"; the xAI provider entry
+    // holds { key: <JWT access>, refresh_token, oidc_client_id, email, ... }.
+    // Same freshest-chain-plus-ancestor guard as the other sources so a failed
+    // write-back after a rotation can't strand the CLI's only valid refresh token.
+    static var memoryAuth: [String: Any]?
+    static var memoryAncestor: String?
+    static let memoryLock = NSLock()
+
+    func fetch() -> ServiceUsage {
+        do {
+            var (auth, ancestor) = try readAuth()
+            var entry = try providerEntry(auth).entry
+            if jwtExpiry(entry["key"] as? String) < Date().timeIntervalSince1970 + 60 {
+                (auth, ancestor) = try refresh(auth, ancestorToken: ancestor)
+                entry = try providerEntry(auth).entry
+            }
+            guard let token = entry["key"] as? String else {
+                throw FetchError.notLoggedIn("No access token — run `grok login`")
+            }
+            do {
+                return try usage(token: token, entry: entry)
+            } catch FetchError.http(401, _) {
+                (auth, _) = try refresh(auth, ancestorToken: ancestor)
+                entry = try providerEntry(auth).entry
+                guard let retry = entry["key"] as? String else {
+                    throw FetchError.notLoggedIn("No access token after refresh")
+                }
+                return try usage(token: retry, entry: entry)
+            }
+        } catch {
+            var usage = ServiceUsage()
+            usage.error = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            return usage
+        }
+    }
+
+    private func usage(token: String, entry: [String: Any]) throws -> ServiceUsage {
+        let json = try httpJSON(Self.usageURL, headers: [
+            "Authorization": "Bearer \(token)",
+            "x-grok-client-mode": "cli",
+            "User-Agent": Self.userAgent,
+        ])
+        guard let config = json["config"] as? [String: Any] else {
+            throw FetchError.parse("no billing config in response")
+        }
+        var usage = ServiceUsage()
+        usage.account = entry["email"] as? String
+        let reset = parseISO((config["currentPeriod"] as? [String: Any])?["end"])
+        if let used = (config["creditUsagePercent"] as? NSNumber)?.doubleValue {
+            usage.windows.append(UsageWindow(label: "Weekly", usedPercent: used, resetsAt: reset))
+        }
+        for product in (config["productUsage"] as? [[String: Any]]) ?? [] {
+            guard let used = (product["usagePercent"] as? NSNumber)?.doubleValue else { continue }
+            let raw = (product["product"] as? String) ?? "Usage"
+            let label = raw.hasPrefix("Grok") ? String(raw.dropFirst(4)) : raw
+            usage.extras.append(UsageWindow(label: label, usedPercent: used, resetsAt: reset))
+        }
+        guard !usage.windows.isEmpty else { throw FetchError.parse("no usage windows in response") }
+        return usage
+    }
+
+    // The xAI provider entry within the auth map, plus its map key.
+    private func providerEntry(_ auth: [String: Any]) throws -> (key: String, entry: [String: Any]) {
+        let match = auth.first { key, value in
+            key.hasPrefix("https://auth.x.ai") && (value as? [String: Any])?["refresh_token"] != nil
+        } ?? auth.first { _, value in
+            (value as? [String: Any])?["refresh_token"] != nil
+        }
+        guard let match, let entry = match.value as? [String: Any] else {
+            throw FetchError.notLoggedIn("No Grok login in auth.json — run `grok login`")
+        }
+        return (match.key, entry)
+    }
+
+    private func providerRefreshToken(_ auth: [String: Any]?) -> String? {
+        guard let auth, let entry = try? providerEntry(auth).entry else { return nil }
+        return entry["refresh_token"] as? String
+    }
+
+    private func jwtExpiry(_ jwt: String?) -> Double {
+        guard let jwt else { return 0 }
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return 0 }
+        var b64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        b64 += String(repeating: "=", count: (4 - b64.count % 4) % 4)
+        guard let data = Data(base64Encoded: b64),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = (object["exp"] as? NSNumber)?.doubleValue else { return 0 }
+        return exp
+    }
+
+    private func readAuth() throws -> (auth: [String: Any], ancestor: String) {
+        var storeAbsent = false
+        let store: [String: Any]?
+        do {
+            store = try readStore()
+        } catch FetchError.notLoggedIn {
+            store = nil
+            storeAbsent = true
+        } catch {
+            store = nil
+        }
+        let storeToken = providerRefreshToken(store)
+        Self.memoryLock.lock()
+        let cached = Self.memoryAuth
+        let cachedAncestor = Self.memoryAncestor
+        Self.memoryLock.unlock()
+        if let cached, let cachedAncestor {
+            if storeAbsent {
+                clearMemory()
+            } else if store == nil {
+                return (cached, cachedAncestor)  // transiently unreadable: memory carries the chain
+            } else if let storeToken, storeToken == cachedAncestor {
+                if persist(cached, consumedRefreshToken: cachedAncestor, ancestorToken: cachedAncestor),
+                   let own = providerRefreshToken(cached) {
+                    return (cached, own)
+                }
+                return (cached, cachedAncestor)
+            } else {
+                clearMemory()  // store moved past us (new login / CLI rotation): adopt it
+            }
+        }
+        guard let store else {
+            throw FetchError.notLoggedIn("~/.grok/auth.json not found — run `grok login`")
+        }
+        return (store, storeToken ?? "")
+    }
+
+    private func clearMemory() {
+        Self.memoryLock.lock()
+        Self.memoryAuth = nil
+        Self.memoryAncestor = nil
+        Self.memoryLock.unlock()
+    }
+
+    private func readStore() throws -> [String: Any] {
+        guard FileManager.default.fileExists(atPath: Self.authPath) else {
+            throw FetchError.notLoggedIn("~/.grok/auth.json not found — run `grok login`")
+        }
+        guard let data = FileManager.default.contents(atPath: Self.authPath),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw FetchError.parse("Grok auth.json unreadable")
+        }
+        return object
+    }
+
+    private func refresh(_ auth: [String: Any], ancestorToken: String)
+        throws -> (auth: [String: Any], ancestor: String) {
+        let (providerKey, entry) = try providerEntry(auth)
+        guard let refreshToken = entry["refresh_token"] as? String,
+              let clientID = entry["oidc_client_id"] as? String else {
+            throw FetchError.notLoggedIn("No refresh token — run `grok login`")
+        }
+        let json = try httpJSON(Self.tokenURL, method: "POST",
+            headers: ["User-Agent": Self.userAgent],
+            formBody: ["grant_type": "refresh_token",
+                       "refresh_token": refreshToken,
+                       "client_id": clientID])
+        guard let accessToken = json["access_token"] as? String else {
+            throw FetchError.parse("Grok token refresh missing access_token")
+        }
+        var newEntry = entry
+        newEntry["key"] = accessToken
+        if let newRefresh = json["refresh_token"] as? String { newEntry["refresh_token"] = newRefresh }
+        if let expiresIn = (json["expires_in"] as? NSNumber)?.doubleValue {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            newEntry["expires_at"] = formatter.string(from: Date().addingTimeInterval(expiresIn))
+        }
+        var newAuth = auth
+        newAuth[providerKey] = newEntry
+        Self.memoryLock.lock()
+        Self.memoryAuth = newAuth
+        Self.memoryAncestor = ancestorToken
+        Self.memoryLock.unlock()
+        if persist(newAuth, consumedRefreshToken: refreshToken, ancestorToken: ancestorToken),
+           let own = newEntry["refresh_token"] as? String {
+            return (newAuth, own)
+        }
+        return (newAuth, ancestorToken)
+    }
+
+    // Write back so the Grok CLI and this app share one valid token chain. Only
+    // replace a store that still holds our chain's past (the token we consumed or
+    // the ancestor); anything else is a foreign login and must not be clobbered.
+    @discardableResult
+    private func persist(_ newAuth: [String: Any], consumedRefreshToken: String, ancestorToken: String) -> Bool {
+        guard let current = try? readStore(),
+              let (providerKey, currentEntry) = try? providerEntry(current),
+              let storeToken = currentEntry["refresh_token"] as? String else {
+            NSLog("LimitBar: grok auth.json not in a known state during write-back; keeping refreshed token in memory")
+            return false
+        }
+        guard storeToken == consumedRefreshToken || storeToken == ancestorToken else {
+            clearMemory()  // foreign chain: the store is the newer truth
+            return false
+        }
+        guard let newEntry = newAuth[providerKey] as? [String: Any] else { return false }
+        // Splice only the token fields so anything else the CLI wrote survives.
+        var mergedEntry = currentEntry
+        for key in ["key", "refresh_token", "expires_at"] { mergedEntry[key] = newEntry[key] }
+        var merged = current
+        merged[providerKey] = mergedEntry
+        do {
+            let data = try JSONSerialization.data(withJSONObject: merged, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: Self.authPath), options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.authPath)
+            clearMemory()
+            return true
+        } catch {
+            NSLog("LimitBar: grok auth.json write-back failed (%@); keeping refreshed token in memory", "\(error)")
+            return false
+        }
+    }
+}
+
 // MARK: - Icons (drawn in code, template images so they adapt to menu bar appearance)
 
 enum Icons {
@@ -598,37 +834,339 @@ enum Icons {
         image.isTemplate = true
         return image
     }
+
+    static func grok() -> NSImage {
+        let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            let transform = NSAffineTransform()
+            transform.scale(by: rect.width / 16)
+            transform.concat()
+            NSColor.black.setStroke()
+            // Grok: an angular blade — a long diagonal slash with a shorter parallel accent.
+            let strokes: [(NSPoint, NSPoint)] = [
+                (NSPoint(x: 4.2, y: 2.6), NSPoint(x: 12.0, y: 12.4)),
+                (NSPoint(x: 4.2, y: 7.4), NSPoint(x: 8.1, y: 12.4)),
+            ]
+            for (a, b) in strokes {
+                let path = NSBezierPath()
+                path.lineWidth = 2.1
+                path.lineCapStyle = .round
+                path.move(to: a)
+                path.line(to: b)
+                path.stroke()
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+}
+
+// MARK: - Services & preferences
+
+enum Service: String, CaseIterable, Identifiable {
+    case claude, codex, grok
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+    var icon: NSImage {
+        switch self {
+        case .claude: return Icons.claude()
+        case .codex: return Icons.openAI()
+        case .grok: return Icons.grok()
+        }
+    }
+    func fetch() -> ServiceUsage {
+        switch self {
+        case .claude: return ClaudeSource().fetch()
+        case .codex: return CodexSource().fetch()
+        case .grok: return GrokSource().fetch()
+        }
+    }
+    var accent: Color {
+        switch self {
+        case .claude: return Color(red: 0.85, green: 0.46, blue: 0.32)
+        case .codex: return Color(red: 0.10, green: 0.66, blue: 0.52)
+        case .grok: return Color(red: 0.40, green: 0.52, blue: 0.96)
+        }
+    }
+    private var defaultsKey: String { "service.\(rawValue).enabled" }
+    var isEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: defaultsKey) as? Bool ?? true }
+        nonmutating set { UserDefaults.standard.set(newValue, forKey: defaultsKey) }
+    }
+}
+
+final class LimitStore: ObservableObject {
+    @Published var usage: [Service: ServiceUsage] = [:]
+    @Published var enabled: [Service: Bool] = [:]
+    @Published var lastUpdated: Date?
+    @Published var isFetching = false
+    @Published var launchAtLogin = false
+
+    var onRefresh: () -> Void = {}
+    var onSetEnabled: (Service, Bool) -> Void = { _, _ in }
+    var onSetLaunch: (Bool) -> Void = { _ in }
+    var onQuit: () -> Void = {}
+}
+
+private func clockString(_ date: Date) -> String {
+    let f = DateFormatter()
+    f.dateFormat = Calendar.current.isDateInToday(date) ? "h:mm a" : "EEE h:mm a"
+    return f.string(from: date)
+}
+
+// MARK: - Liquid Glass helpers
+
+@available(macOS 26.0, *)
+private func regularGlass(tint: Color?) -> Glass {
+    guard let tint else { return .regular }
+    return Glass.regular.tint(tint.opacity(0.16))
+}
+
+extension View {
+    // Native Liquid Glass on macOS 26+, with a material fallback on older systems.
+    @ViewBuilder
+    func glassPanel(_ radius: CGFloat, tint: Color? = nil) -> some View {
+        if #available(macOS 26.0, *) {
+            self.glassEffect(regularGlass(tint: tint),
+                             in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+        } else {
+            self
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+        }
+    }
+}
+
+// MARK: - Popover UI
+
+struct PopoverView: View {
+    @ObservedObject var store: LimitStore
+
+    private var visible: [Service] { Service.allCases.filter { store.enabled[$0] == true } }
+    private var enabledCount: Int { visible.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            header
+            servicesSection
+            Divider().opacity(0.35)
+            visibilityRow
+            footer
+        }
+        .padding(16)
+        .frame(width: 320)
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text("LimitBar").font(.system(size: 15, weight: .bold))
+            Spacer()
+            if store.isFetching {
+                ProgressView().controlSize(.small).scaleEffect(0.8)
+            } else if let updated = store.lastUpdated {
+                Text("updated \(clockString(updated))")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            Button { store.onRefresh() } label: {
+                Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("Refresh now")
+        }
+    }
+
+    @ViewBuilder private func serviceCards() -> some View {
+        VStack(spacing: 12) {
+            ForEach(visible) { service in
+                ServiceCardView(service: service, usage: store.usage[service])
+            }
+        }
+    }
+
+    @ViewBuilder private var servicesSection: some View {
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: 12) { serviceCards() }
+        } else {
+            serviceCards()
+        }
+    }
+
+    private var visibilityRow: some View {
+        HStack(spacing: 7) {
+            Text("Show").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+            Spacer()
+            ForEach(Service.allCases) { service in
+                let on = store.enabled[service] == true
+                let lockLast = on && enabledCount <= 1
+                Button { store.onSetEnabled(service, !on) } label: {
+                    Text(service.title).font(.system(size: 11, weight: .medium))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                }
+                .buttonStyle(ChipStyle(on: on, accent: service.accent))
+                .disabled(lockLast)
+                .help(lockLast ? "At least one service must stay visible"
+                               : (on ? "Hide \(service.title)" : "Show \(service.title)"))
+            }
+        }
+    }
+
+    private var footer: some View {
+        VStack(spacing: 10) {
+            Toggle(isOn: Binding(get: { store.launchAtLogin },
+                                 set: { store.onSetLaunch($0) })) {
+                Text("Launch at login").font(.system(size: 12))
+            }
+            .toggleStyle(.switch).controlSize(.small)
+            Button { store.onQuit() } label: {
+                Text("Quit LimitBar").font(.system(size: 12, weight: .medium))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered).controlSize(.large)
+        }
+    }
+}
+
+struct ServiceCardView: View {
+    let service: Service
+    let usage: ServiceUsage?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 9) {
+                Image(nsImage: service.icon)
+                    .renderingMode(.template)
+                    .resizable().frame(width: 16, height: 16)
+                    .foregroundStyle(service.accent)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(service.title).font(.system(size: 14, weight: .semibold))
+                    if let account = usage?.account, !account.isEmpty {
+                        Text(account).font(.system(size: 10.5))
+                            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                    }
+                }
+                Spacer(minLength: 6)
+                if let plan = usage?.plan, !plan.isEmpty {
+                    Text(plan).font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(service.accent.opacity(0.16), in: Capsule())
+                        .foregroundStyle(service.accent)
+                }
+            }
+            cardBody
+        }
+        .padding(13)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .glassPanel(18, tint: service.accent)
+    }
+
+    @ViewBuilder private var cardBody: some View {
+        if let usage, let error = usage.error {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 11)).foregroundStyle(.orange)
+                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+        } else if let usage, !usage.windows.isEmpty {
+            VStack(spacing: 9) {
+                ForEach(Array((usage.windows + usage.extras).enumerated()), id: \.offset) { _, window in
+                    UsageBarView(window: window, accent: service.accent)
+                }
+            }
+        } else {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small).scaleEffect(0.7)
+                Text("Loading…").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+struct UsageBarView: View {
+    let window: UsageWindow
+    let accent: Color
+
+    private var remaining: Double { window.remainingPercent }
+    private var barColor: Color {
+        if remaining <= 10 { return .red }
+        if remaining <= 25 { return .orange }
+        return accent
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text(window.label).font(.system(size: 11, weight: .medium))
+                Spacer()
+                Text("\(Int(remaining.rounded()))% left")
+                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(barColor)
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.10))
+                    Capsule().fill(barColor.gradient)
+                        .frame(width: max(3, geo.size.width * remaining / 100))
+                }
+            }
+            .frame(height: 6)
+            if let reset = window.resetsAt {
+                Text("resets \(clockString(reset))")
+                    .font(.system(size: 9.5)).foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+struct ChipStyle: ButtonStyle {
+    let on: Bool
+    let accent: Color
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(on ? AnyShapeStyle(.white) : AnyShapeStyle(Color.secondary))
+            .background {
+                if on {
+                    Capsule().fill(accent.gradient)
+                } else {
+                    Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 1)
+                }
+            }
+            .opacity(configuration.isPressed ? 0.6 : 1)
+            .contentShape(Capsule())
+    }
 }
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var claudeItem: NSStatusItem!
-    private var codexItem: NSStatusItem!
-    private let menu = NSMenu()
-    private var claude = ServiceUsage()
-    private var codex = ServiceUsage()
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let store = LimitStore()
+    private var statusItems: [Service: NSStatusItem] = [:]
+    private let popover = NSPopover()
+    private var fetching: Set<Service> = []
     private var lastUpdated: Date?
-    private var claudeFetching = false
-    private var codexFetching = false
-    private var menuIsOpen = false
-    private var isFetching: Bool { claudeFetching || codexFetching }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Created right-to-left: Codex first so Claude ends up on the left.
-        codexItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        claudeItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        claudeItem.autosaveName = "LimitBar.claude"
-        codexItem.autosaveName = "LimitBar.codex"
-        configure(claudeItem, icon: Icons.claude())
-        configure(codexItem, icon: Icons.openAI())
-        menu.delegate = self
-        menu.autoenablesItems = false
-        claudeItem.menu = menu
-        codexItem.menu = menu
+        for service in Service.allCases { store.enabled[service] = service.isEnabled }
+        store.launchAtLogin = launchEnabled()
+        store.onRefresh = { [weak self] in self?.refresh() }
+        store.onSetEnabled = { [weak self] service, on in self?.setEnabled(service, on) }
+        store.onSetLaunch = { [weak self] on in self?.setLaunch(on) }
+        store.onQuit = { NSApp.terminate(nil) }
 
+        popover.behavior = .transient
+        popover.animates = true
+        let host = NSHostingController(rootView: PopoverView(store: store))
+        host.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = host
+
+        syncStatusItems()
         refresh()
-        // .common so the timer keeps firing while a menu is open.
+        // .common so the timer keeps firing while the popover is open.
         let timer = Timer(timeInterval: 300, repeats: true) { [weak self] _ in
             self?.refresh()
         }
@@ -640,56 +1178,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func configure(_ item: NSStatusItem, icon: NSImage) {
-        guard let button = item.button else { return }
-        button.image = icon
-        button.imagePosition = .imageLeft
-        button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        button.title = " …"
+    // One menu-bar item per enabled service, rebuilt so the left-to-right order
+    // stays Claude · Codex · Grok no matter what order the toggles were flipped.
+    private func syncStatusItems() {
+        for (_, item) in statusItems { NSStatusBar.system.removeStatusItem(item) }
+        statusItems.removeAll()
+        for service in Service.allCases.reversed() where store.enabled[service] == true {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            if let button = item.button {
+                button.image = service.icon
+                button.imagePosition = .imageLeft
+                button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+                button.title = " …"
+                button.target = self
+                button.action = #selector(statusItemClicked(_:))
+            }
+            statusItems[service] = item
+        }
+        updateButtons()
     }
 
-    // Each service fetches and publishes independently, so one wedged or slow
-    // source can never freeze the other item or block future refreshes.
+    @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
+        if popover.isShown { popover.performClose(sender); return }
+        if lastUpdated.map({ Date().timeIntervalSince($0) > 60 }) ?? true { refresh() }
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    // Each enabled service fetches and publishes independently, so one wedged or
+    // slow source can never freeze the others or block future refreshes.
     @objc func refresh() {
-        if !claudeFetching {
-            claudeFetching = true
+        for service in Service.allCases where store.enabled[service] == true {
+            guard !fetching.contains(service) else { continue }
+            fetching.insert(service)
+            store.isFetching = true
             DispatchQueue.global().async {
-                let result = ClaudeSource().fetch()
+                let result = service.fetch()
                 DispatchQueue.main.async {
-                    self.claude = result
-                    self.claudeFetching = false
+                    self.store.usage[service] = result
+                    self.fetching.remove(service)
                     self.lastUpdated = Date()
-                    self.updateButtons()
+                    self.store.lastUpdated = self.lastUpdated
+                    self.store.isFetching = !self.fetching.isEmpty
+                    self.updateButton(service)
                 }
             }
         }
-        if !codexFetching {
-            codexFetching = true
-            DispatchQueue.global().async {
-                let result = CodexSource().fetch()
-                DispatchQueue.main.async {
-                    self.codex = result
-                    self.codexFetching = false
-                    self.lastUpdated = Date()
-                    self.updateButtons()
-                }
-            }
-        }
-        if menuIsOpen { rebuildMenu() }
     }
 
-    private func updateButtons() {
-        update(item: claudeItem, usage: claude, name: "Claude")
-        update(item: codexItem, usage: codex, name: "Codex")
-        // Keep an open menu in sync with data landing underneath it.
-        if menuIsOpen { rebuildMenu() }
-    }
+    private func updateButtons() { for service in Service.allCases { updateButton(service) } }
 
-    private func update(item: NSStatusItem, usage: ServiceUsage, name: String) {
-        guard let button = item.button else { return }
+    private func updateButton(_ service: Service) {
+        guard let button = statusItems[service]?.button else { return }
+        let usage = store.usage[service] ?? ServiceUsage()
         guard usage.error == nil, let binding = usage.binding else {
-            button.title = " –"
-            button.toolTip = "\(name): \(usage.error ?? "no data")"
+            button.title = usage.error == nil ? " …" : " –"
+            button.toolTip = "\(service.title): \(usage.error ?? "loading…")"
             return
         }
         let pct = Int(binding.remainingPercent.rounded())
@@ -703,136 +1248,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.title = text
         }
         let who = usage.account.map { " (\($0))" } ?? ""
-        button.toolTip = name + who + " — " + usage.windows
+        button.toolTip = service.title + who + " — " + usage.windows
             .map { "\($0.label): \(Int($0.remainingPercent.rounded()))% left" }
             .joined(separator: " · ")
     }
 
-    // MARK: Menu
+    // MARK: Preferences
 
-    func menuWillOpen(_ menu: NSMenu) {
-        menuIsOpen = true
-        rebuildMenu()
-        if lastUpdated.map({ Date().timeIntervalSince($0) > 60 }) ?? true {
-            refresh()
+    private func setEnabled(_ service: Service, _ on: Bool) {
+        let count = Service.allCases.filter { store.enabled[$0] == true }.count
+        if !on && count <= 1 {
+            store.enabled[service] = true  // keep one item so the popover stays reachable
+            return
         }
+        service.isEnabled = on
+        store.enabled[service] = on
+        syncStatusItems()
+        if on { refresh() }
     }
 
-    func menuDidClose(_ menu: NSMenu) {
-        menuIsOpen = false
+    private func launchEnabled() -> Bool {
+        if #available(macOS 13.0, *) { return SMAppService.mainApp.status == .enabled }
+        return false
     }
 
-    private func rebuildMenu() {
-        let items = buildMenuItems()
-        // While the menu is open, prefer updating titles in place: a full
-        // remove-and-re-add shifts rows under the cursor and drops the highlight.
-        let structureMatches = menu.items.count == items.count
-            && zip(menu.items, items).allSatisfy {
-                $0.isSeparatorItem == $1.isSeparatorItem && $0.action == $1.action
-            }
-        if structureMatches {
-            for (old, new) in zip(menu.items, items) where !old.isSeparatorItem {
-                old.title = new.title
-                old.isEnabled = new.isEnabled
-                old.state = new.state
-            }
-        } else {
-            menu.removeAllItems()
-            items.forEach { menu.addItem($0) }
-        }
-    }
-
-    private func buildMenuItems() -> [NSMenuItem] {
-        var items: [NSMenuItem] = []
-        items += sectionItems(name: "Claude", usage: claude)
-        items.append(.separator())
-        items += sectionItems(name: "Codex", usage: codex)
-        items.append(.separator())
-
-        let updatedTitle = isFetching
-            ? "Updating…"
-            : lastUpdated.map { "Updated \(timeFormatter.string(from: $0))" } ?? "Updating…"
-        let updated = NSMenuItem(title: updatedTitle, action: nil, keyEquivalent: "")
-        updated.isEnabled = false
-        items.append(updated)
-
-        let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refresh), keyEquivalent: "r")
-        refreshItem.target = self
-        items.append(refreshItem)
-
-        if #available(macOS 13.0, *) {
-            let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
-            login.target = self
-            login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-            items.append(login)
-        }
-        items.append(.separator())
-        let quit = NSMenuItem(title: "Quit LimitBar", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quit.target = NSApp
-        items.append(quit)
-        return items
-    }
-
-    private func sectionItems(name: String, usage: ServiceUsage) -> [NSMenuItem] {
-        let title = usage.plan.map { "\(name) — \($0) plan" } ?? name
-        let header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        var items = [header]
-        if let error = usage.error {
-            let item = NSMenuItem(title: "⚠︎ " + String(error.prefix(70)), action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            item.indentationLevel = 1
-            items.append(item)
-            return items
-        }
-        if let account = usage.account, !account.isEmpty {
-            let acct = NSMenuItem(title: account, action: nil, keyEquivalent: "")
-            acct.isEnabled = false
-            acct.indentationLevel = 1
-            items.append(acct)
-        }
-        for w in usage.windows + usage.extras {
-            let line = "\(w.label): \(Int(w.remainingPercent.rounded()))% left\(resetSuffix(w.resetsAt))"
-            let item = NSMenuItem(title: line, action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            item.indentationLevel = 1
-            items.append(item)
-        }
-        return items
-    }
-
-    private let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        return f
-    }()
-
-    private func resetSuffix(_ date: Date?) -> String {
-        guard let date else { return "" }
-        let f = DateFormatter()
-        f.dateFormat = Calendar.current.isDateInToday(date) ? "h:mm a" : "EEE h:mm a"
-        return " · resets \(f.string(from: date))"
-    }
-
-    @objc private func toggleLogin() {
+    private func setLaunch(_ on: Bool) {
         guard #available(macOS 13.0, *) else { return }
-        let service = SMAppService.mainApp
         do {
-            if service.status == .enabled {
-                try service.unregister()
-            } else {
-                try service.register()
-            }
+            if on { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
         } catch {
             NSLog("Launch-at-login toggle failed: \(error)")
         }
+        store.launchAtLogin = launchEnabled()
     }
 }
 
 // MARK: - CLI modes for headless testing
 
 func dumpIcons(to dir: String) {
-    for (name, image) in [("claude", Icons.claude()), ("openai", Icons.openAI())] {
+    for (name, image) in [("claude", Icons.claude()), ("openai", Icons.openAI()), ("grok", Icons.grok())] {
         let px = 128
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
                                          bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -866,6 +1321,35 @@ func describeFetch() {
     }
     describe("Claude", ClaudeSource().fetch())
     describe("Codex", CodexSource().fetch())
+    describe("Grok", GrokSource().fetch())
+}
+
+// Render the popover to a PNG over a backdrop so the layout can be eyeballed
+// without opening the menu bar. Real Liquid Glass only composites live on screen;
+// here the translucent panels rasterize flat, but text/bars/spacing are faithful.
+@MainActor
+func renderPopover(to path: String) {
+    _ = NSApplication.shared
+    let store = LimitStore()
+    for service in Service.allCases { store.enabled[service] = true }
+    store.usage[.claude] = ClaudeSource().fetch()
+    store.usage[.codex] = CodexSource().fetch()
+    store.usage[.grok] = GrokSource().fetch()
+    store.lastUpdated = Date()
+    let root = PopoverView(store: store)
+        .padding(22)
+        .background(LinearGradient(
+            colors: [Color(red: 0.17, green: 0.18, blue: 0.24), Color(red: 0.07, green: 0.08, blue: 0.11)],
+            startPoint: .topLeading, endPoint: .bottomTrailing))
+        .frame(width: 364)
+    let renderer = ImageRenderer(content: root)
+    renderer.scale = 2
+    guard let image = renderer.nsImage,
+          let tiff = image.tiffRepresentation,
+          let rep = NSBitmapImageRep(data: tiff),
+          let png = rep.representation(using: .png, properties: [:]) else { return }
+    try? png.write(to: URL(fileURLWithPath: path))
+    print("\(path) (\(Int(image.size.width))×\(Int(image.size.height)))")
 }
 
 let arguments = CommandLine.arguments
@@ -877,6 +1361,16 @@ if let flagIndex = arguments.firstIndex(of: "--dump-icons") {
 if arguments.contains("--test-fetch") {
     describeFetch()
     exit(0)
+}
+if let flagIndex = arguments.firstIndex(of: "--render-popover") {
+    let path = arguments.count > flagIndex + 1 ? arguments[flagIndex + 1] : "popover.png"
+    let renderApp = NSApplication.shared
+    renderApp.setActivationPolicy(.accessory)
+    Task { @MainActor in
+        renderPopover(to: path)
+        exit(0)
+    }
+    renderApp.run()
 }
 
 let app = NSApplication.shared
