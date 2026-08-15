@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Security
 import ServiceManagement
 import SwiftUI
 
@@ -232,17 +233,27 @@ struct ClaudeSource {
         Self.memoryLock.unlock()
     }
 
+    // Read via the native Security API rather than the `security` CLI: when this
+    // app isn't yet trusted for the item, a direct call raises the "Always Allow"
+    // keychain prompt in the GUI. A spawned `security` is instead attributed to
+    // this app as the responsible process and fails outright without ever
+    // prompting (surfacing as errSecItemNotFound), which is unfixable by the user.
     private func readStore() throws -> [String: Any] {
-        let (status, out) = shell(["/usr/bin/security", "find-generic-password",
-                                   "-s", Self.keychainService, "-w"])
-        if status == 44 {  // errSecItemNotFound: affirmative absence, i.e. logged out
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.keychainService,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
             throw FetchError.notLoggedIn("Keychain item not found — log in with `claude`")
         }
-        guard status == 0, !out.isEmpty else {
-            throw FetchError.parse("keychain unavailable (status \(status))")
+        guard status == errSecSuccess, let data = result as? Data else {
+            throw FetchError.parse("keychain locked or access denied (OSStatus \(status))")
         }
-        guard let data = out.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let creds = object["claudeAiOauth"] as? [String: Any] else {
             throw FetchError.parse("unrecognized keychain credential format")
         }
@@ -300,15 +311,23 @@ struct ClaudeSource {
         // Splice only the token fields so anything else the CLI wrote meanwhile survives.
         var merged = current
         for key in ["accessToken", "refreshToken", "expiresAt"] { merged[key] = creds[key] }
-        guard let data = try? JSONSerialization.data(withJSONObject: ["claudeAiOauth": merged]),
-              let payload = String(data: data, encoding: .utf8) else { return false }
-        let (status, _) = shell(["/usr/bin/security", "add-generic-password", "-U",
-                                 "-s", Self.keychainService, "-a", NSUserName(), "-w", payload])
-        if status == 0 {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["claudeAiOauth": merged]) else { return false }
+        let match: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.keychainService,
+        ]
+        var status = SecItemUpdate(match as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var add = match
+            add[kSecAttrAccount as String] = NSUserName()
+            add[kSecValueData as String] = data
+            status = SecItemAdd(add as CFDictionary, nil)
+        }
+        if status == errSecSuccess {
             clearMemory()
             return true
         }
-        NSLog("LimitBar: keychain write-back failed (status %d); keeping refreshed token in memory", status)
+        NSLog("LimitBar: keychain write-back failed (OSStatus %d); keeping refreshed token in memory", status)
         return false
     }
 }
@@ -843,12 +862,12 @@ enum Icons {
             NSColor.black.setStroke()
             // Grok: an angular blade — a long diagonal slash with a shorter parallel accent.
             let strokes: [(NSPoint, NSPoint)] = [
-                (NSPoint(x: 4.2, y: 2.6), NSPoint(x: 12.0, y: 12.4)),
-                (NSPoint(x: 4.2, y: 7.4), NSPoint(x: 8.1, y: 12.4)),
+                (NSPoint(x: 3.9, y: 2.3), NSPoint(x: 12.3, y: 12.7)),
+                (NSPoint(x: 3.9, y: 7.2), NSPoint(x: 8.2, y: 12.7)),
             ]
             for (a, b) in strokes {
                 let path = NSBezierPath()
-                path.lineWidth = 2.1
+                path.lineWidth = 2.6
                 path.lineCapStyle = .round
                 path.move(to: a)
                 path.line(to: b)
@@ -1185,6 +1204,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItems.removeAll()
         for service in Service.allCases.reversed() where store.enabled[service] == true {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+            // Stable identity so macOS remembers each icon's slot; drag them
+            // together once (⌘-drag) and the grouping sticks across launches.
+            item.autosaveName = "LimitBar.\(service.rawValue)"
             if let button = item.button {
                 button.image = service.icon
                 button.imagePosition = .imageLeft
